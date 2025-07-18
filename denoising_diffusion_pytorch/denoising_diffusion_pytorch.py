@@ -295,7 +295,8 @@ class Unet(Module):
         attn_dim_head = 32,
         attn_heads = 4,
         full_attn = None,    # defaults to full attention only for inner most layer
-        flash_attn = False
+        flash_attn = False,
+        cond_channels=0,  # number of condition channels (19 for our semantic conditioning, probably 3 for masked conditioninig)
     ):
         super().__init__()
 
@@ -303,7 +304,8 @@ class Unet(Module):
 
         self.channels = channels
         self.self_condition = self_condition
-        input_channels = channels * (2 if self_condition else 1)
+        self.cond_channels = cond_channels
+        input_channels = channels * (2 if self_condition else 1) + cond_channels
 
         init_dim = default(init_dim, dim)
         self.init_conv = nn.Conv2d(input_channels, init_dim, 7, padding = 3)
@@ -393,12 +395,28 @@ class Unet(Module):
     def downsample_factor(self):
         return 2 ** (len(self.downs) - 1)
 
-    def forward(self, x, time, x_self_cond = None):
+    def forward(self, x, time, x_self_cond = None, cond=None):
         assert all([divisible_by(d, self.downsample_factor) for d in x.shape[-2:]]), f'your input dimensions {x.shape[-2:]} need to be divisible by {self.downsample_factor}, given the unet'
 
         if self.self_condition:
             x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
             x = torch.cat((x_self_cond, x), dim = 1)
+
+        if self.cond_channels > 0:
+            if cond is None:
+                raise ValueError("UNet was constructed with cond_channels > 0 but no `cond` tensor was passed.")
+            # safety checks
+            if cond.shape[0] != x.shape[0]:
+                raise ValueError(f"Batch mismatch: x batch {x.shape[0]} vs cond batch {cond.shape[0]}")
+            if cond.shape[-2:] != x.shape[-2:]:
+                raise ValueError(f"Spatial size mismatch: x {x.shape[-2:]} vs cond {cond.shape[-2:]}")
+            if cond.shape[1] != self.cond_channels:
+                raise ValueError(f"Expected cond_channels={self.cond_channels}, got {cond.shape[1]}")
+            x = torch.cat((x, cond), dim=1)
+        else:
+            # If constructed w/out conditioning, ignore any passed cond silently (optional: warn)
+            pass
+
 
         x = self.init_conv(x)
         r = x.clone()
@@ -644,8 +662,8 @@ class GaussianDiffusion(Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False):
-        model_output = self.model(x, t, x_self_cond)
+    def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False, cond = None,):
+        model_output = self.model(x, t, x_self_cond, cond=cond)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
         if self.objective == 'pred_noise':
@@ -669,8 +687,8 @@ class GaussianDiffusion(Module):
 
         return ModelPrediction(pred_noise, x_start)
 
-    def p_mean_variance(self, x, t, x_self_cond = None, clip_denoised = True):
-        preds = self.model_predictions(x, t, x_self_cond)
+    def p_mean_variance(self, x, t, x_self_cond = None, clip_denoised = True, cond = None):
+        preds = self.model_predictions(x, t, x_self_cond, cond=cond)
         x_start = preds.pred_x_start
 
         if clip_denoised:
@@ -680,16 +698,16 @@ class GaussianDiffusion(Module):
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.inference_mode()
-    def p_sample(self, x, t: int, x_self_cond = None):
+    def p_sample(self, x, t: int, x_self_cond = None, cond = None):
         b, *_, device = *x.shape, self.device
         batched_times = torch.full((b,), t, device = device, dtype = torch.long)
-        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = True)
+        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = True, cond=cond)
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
         pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
         return pred_img, x_start
 
     @torch.inference_mode()
-    def p_sample_loop(self, shape, return_all_timesteps = False):
+    def p_sample_loop(self, shape, return_all_timesteps = False, cond=None):
         batch, device = shape[0], self.device
 
         img = torch.randn(shape, device = device)
@@ -699,7 +717,7 @@ class GaussianDiffusion(Module):
 
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
             self_cond = x_start if self.self_condition else None
-            img, x_start = self.p_sample(img, t, self_cond)
+            img, x_start = self.p_sample(img, t, self_cond, cond)
             imgs.append(img)
 
         ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
@@ -708,7 +726,7 @@ class GaussianDiffusion(Module):
         return ret
 
     @torch.inference_mode()
-    def ddim_sample(self, shape, return_all_timesteps = False):
+    def ddim_sample(self, shape, return_all_timesteps = False, cond = None):
         batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
         times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
@@ -723,7 +741,7 @@ class GaussianDiffusion(Module):
         for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
             time_cond = torch.full((batch,), time, device = device, dtype = torch.long)
             self_cond = x_start if self.self_condition else None
-            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, clip_x_start = True, rederive_pred_noise = True)
+            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, clip_x_start = True, rederive_pred_noise = True, cond=cond)
 
             if time_next < 0:
                 img = x_start
@@ -750,13 +768,13 @@ class GaussianDiffusion(Module):
         return ret
 
     @torch.inference_mode()
-    def sample(self, batch_size = 16, return_all_timesteps = False):
+    def sample(self, batch_size = 16, return_all_timesteps = False, cond=None):
         (h, w), channels = self.image_size, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
-        return sample_fn((batch_size, channels, h, w), return_all_timesteps = return_all_timesteps)
+        return sample_fn((batch_size, channels, h, w), return_all_timesteps = return_all_timesteps, cond= cond)
 
     @torch.inference_mode()
-    def interpolate(self, x1, x2, t = None, lam = 0.5):
+    def interpolate(self, x1, x2, t = None, lam = 0.5, cond = None):
         b, *_, device = *x1.shape, x1.device
         t = default(t, self.num_timesteps - 1)
 
@@ -771,7 +789,7 @@ class GaussianDiffusion(Module):
 
         for i in tqdm(reversed(range(0, t)), desc = 'interpolation sample time step', total = t):
             self_cond = x_start if self.self_condition else None
-            img, x_start = self.p_sample(img, i, self_cond)
+            img, x_start = self.p_sample(img, i, self_cond, cond=cond)
 
         return img
 
@@ -794,7 +812,7 @@ class GaussianDiffusion(Module):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, noise = None, offset_noise_strength = None, spatial_mask = None):
+    def p_losses(self, x_start, t, noise = None, offset_noise_strength = None, spatial_mask = None, cond= None):
 
         b, c, h, w = x_start.shape
 
@@ -849,7 +867,7 @@ class GaussianDiffusion(Module):
 
         # predict and take gradient step
 
-        model_out = self.model(x, t, x_self_cond)
+        model_out = self.model(x, t, x_self_cond, cond=cond)
 
         if self.objective == 'pred_noise':
             target = noise
@@ -893,7 +911,9 @@ class Dataset(Dataset):
         exts = ['jpg', 'jpeg', 'png', 'tiff'],
         augment_horizontal_flip = False,
         convert_image_to = None,
-        mask_folder = None
+        mask_folder = None,
+        conditional_mask = False,
+        noise_mask = False,
     ):
         super().__init__()
         self.folder = folder
@@ -902,6 +922,10 @@ class Dataset(Dataset):
         self.mask_folder = mask_folder
         self.mask_paths = [p for ext in exts for p in Path(f'{mask_folder}').glob(f'**/*.{ext}')]
         self.augment_horizontal_flip = augment_horizontal_flip
+        self.conditional_mask = conditional_mask
+        self.noise_mask = noise_mask
+
+        assert (not (noise_mask and conditional_mask)), "Noise Mask and Conditional Mask cannot be turned on at the same time"
 
 
         maybe_convert_fn = partial(convert_image_to_fn, convert_image_to) if exists(convert_image_to) else nn.Identity()
@@ -950,6 +974,13 @@ class Dataset(Dataset):
 
         return noise_mask.unsqueeze(0)  # (1,H,W)
 
+    def _one_hot_encode_mask(self, label_tensor, num_classes):
+        # label_tensor shape: (H,W), values in 0..num_classes-1
+        one_hot = torch.nn.functional.one_hot(label_tensor, num_classes=num_classes)  # (H,W,num_classes)
+        one_hot = one_hot.permute(2, 0, 1).float()  # (num_classes,H,W)
+        return one_hot
+
+
     def __len__(self):
         return len(self.paths)
 
@@ -961,8 +992,6 @@ class Dataset(Dataset):
         if self.mask_folder:
             mask_path = self._get_mask_path(path)
             mask_img = Image.open(mask_path)
-
-        # --- Apply transforms manually, preserving randomness for flip ---
 
         # Resize
         img = TF.resize(img, self.image_size, interpolation=InterpolationMode.BILINEAR)
@@ -981,12 +1010,17 @@ class Dataset(Dataset):
         if mask_img:
             mask_img = TF.center_crop(mask_img, self.image_size)
 
-        # Convert to tensor and normalize image
         img_tensor = TF.to_tensor(img)
 
-        if mask_img:
+        if self.noise_mask and mask_img is not None:
             noise_mask = self._load_and_convert_mask(mask_img)
             return img_tensor, noise_mask
+
+        if self.conditional_mask and mask_img is not None:
+            label_np = np.array(mask_img, dtype=np.uint8)
+            label_tensor = torch.from_numpy(label_np).long()
+            cond_mask = self._one_hot_encode_mask(label_tensor, num_classes=len(self.class_noise_map))
+            return img_tensor, cond_mask
 
         return img_tensor
 
@@ -1019,7 +1053,8 @@ class Trainer:
         max_grad_norm = 1.,
         num_fid_samples = 50000,
         save_best_and_latest_only = False,
-        spatial_mask_type = None,
+        adaptive_mask_type = None,
+        conditional_mask_type = None,
         mask_folder = None,
     ):
         super().__init__()
@@ -1042,8 +1077,11 @@ class Trainer:
             convert_image_to = {1: 'L', 3: 'RGB', 4: 'RGBA'}.get(self.channels)
 
         ## masking stuff
-        self.spatial_mask_type = spatial_mask_type
+        self.adaptive_mask_type = adaptive_mask_type
         self.mask_folder = mask_folder
+
+        # conditional concat stuff
+        self.conditional_mask_type = conditional_mask_type
 
         # sampling and training hyperparameters
         assert has_int_squareroot(num_samples), 'number of samples must have an integer square root'
@@ -1060,9 +1098,12 @@ class Trainer:
         self.max_grad_norm = max_grad_norm
 
         # dataset and dataloader
-
-        if spatial_mask_type == "semantic":
-            self.ds = Dataset(folder, self.image_size, mask_folder=self.mask_folder, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+        # either we want to add semantic mask to noise or concat semantic mask
+        assert (not (adaptive_mask_type is not None and conditional_mask_type is not None)), f"Cannot have both adaptive_mask_type = {adaptive_mask_type} and conditional_mask = {conditional_mask_type} at the same time"
+        if adaptive_mask_type == "semantic":
+            self.ds = Dataset(folder, self.image_size, mask_folder=self.mask_folder, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to, noise_mask=True)
+        elif conditional_mask_type == "semantic":
+            self.ds = Dataset(folder, self.image_size, mask_folder=self.mask_folder, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to, conditional_mask=True)
         else:
             self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
 
@@ -1174,6 +1215,20 @@ class Trainer:
         if exists(self.accelerator.scaler) and exists(data['scaler']):
             self.accelerator.scaler.load_state_dict(data['scaler'])
 
+    def _get_random_cond_batch(self, n, device, cond_type):
+        data = []
+        while len(data) < n:
+            batch = next(self.dl)
+            if cond_type == "semantic":
+                _, mask = batch
+            elif cond_type == "edge_aware":
+                mask = create_edge_aware_mask(batch.to(device))
+            else:
+                raise ("Invalid condition type for generating conditional batch")
+            data.append(mask)
+        return torch.cat(data, dim=0)[:n].to(device)
+
+
     def train(self):
         accelerator = self.accelerator
         device = accelerator.device
@@ -1187,7 +1242,7 @@ class Trainer:
 
                 for _ in range(self.gradient_accumulate_every):
                     spatial_mask = None
-                    if self.spatial_mask_type == "semantic":
+                    if self.adaptive_mask_type == "semantic" or self.conditional_mask_type == "semantic":
                         data, mask = next(self.dl)
                         data = data.to(device)
                         mask = mask.to(device)
@@ -1195,12 +1250,20 @@ class Trainer:
                     else:
                         data = next(self.dl).to(device)
 
-                    if self.spatial_mask_type == "edge_aware":
+                    if self.adaptive_mask_type == "edge_aware" or self.conditional_mask_type == "edge_aware":
                         spatial_mask = create_edge_aware_mask(data, min_noise_scale=0.5, max_noise_scale=1.0)
 
 
                     with self.accelerator.autocast():
-                        loss = self.model(data, spatial_mask=spatial_mask)
+                        if self.adaptive_mask_type is not None:
+                            assert(spatial_mask is not None and self.adaptive_mask_type in ("edge_aware", "semantic")), "Choose correct adaptive mask type"
+                            loss = self.model(data, spatial_mask=spatial_mask)
+                        elif self.conditional_mask_type is not None:
+                            assert(spatial_mask is not None and self.conditional_mask_type in ("edge_aware", "semantic")), "Choose correct conditional mask type"
+                            loss = self.model(data, cond=spatial_mask)
+                        else:
+                            loss = self.model(data)
+
                         loss = loss / self.gradient_accumulate_every
                         total_loss += loss.item()
 
@@ -1226,7 +1289,20 @@ class Trainer:
                         with torch.inference_mode():
                             milestone = self.step // self.save_and_sample_every
                             batches = num_to_groups(self.num_samples, self.batch_size)
-                            all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
+
+                            device = next(self.ema.ema_model.parameters()).device
+                            
+                            conds = None
+                            if self.conditional_mask_type is not None:
+                                conds = self._get_random_cond_batch(self.num_samples, device, self.conditional_mask_type)
+                            all_images_list = []
+
+                            idx = 0
+                            for n in batches:
+                                cond_batch = conds[idx:idx+n] if conds is not None else None
+                                imgs = self.ema.ema_model.sample(batch_size=n, cond=cond_batch)
+                                all_images_list.append(imgs)
+                                idx += n
 
                         all_images = torch.cat(all_images_list, dim = 0)
 
