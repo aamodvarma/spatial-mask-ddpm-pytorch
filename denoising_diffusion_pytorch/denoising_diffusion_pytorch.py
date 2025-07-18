@@ -1,4 +1,7 @@
 import math
+import numpy as np
+import torchvision.transforms.functional as TF
+import kornia  
 import copy
 from pathlib import Path
 from random import random
@@ -35,6 +38,7 @@ from denoising_diffusion_pytorch.version import __version__
 # constants
 
 ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
+
 
 # helpers functions
 
@@ -491,13 +495,18 @@ class GaussianDiffusion(Module):
         offset_noise_strength = 0.,  # https://www.crosslabs.org/blog/diffusion-with-offset-noise
         min_snr_loss_weight = False, # https://arxiv.org/abs/2303.09556
         min_snr_gamma = 5,
-        immiscible = False
+        immiscible = False,
+        adaptive = False,
+        renorm_adaptive_noise = True,
+
     ):
         super().__init__()
         assert not (type(self) == GaussianDiffusion and model.channels != model.out_dim)
         assert not hasattr(model, 'random_or_learned_sinusoidal_cond') or not model.random_or_learned_sinusoidal_cond
 
         self.model = model
+        self.adaptive = adaptive
+        self.renorm_adaptive_noise = renorm_adaptive_noise
 
         self.channels = self.model.channels
         self.self_condition = self.model.self_condition
@@ -785,10 +794,36 @@ class GaussianDiffusion(Module):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, noise = None, offset_noise_strength = None):
+    def p_losses(self, x_start, t, noise = None, offset_noise_strength = None, spatial_mask = None):
+
         b, c, h, w = x_start.shape
 
         noise = default(noise, lambda: torch.randn_like(x_start))
+
+        # if self.adaptive:
+        #     noise = noise * spatial_mask
+
+        # --- spatially adaptive noise ---------------------------------------------------------
+        # spatial_mask is interpreted as noise *std* scale map in (b,1,h,w) or (b,c,h,w).
+        # If None: defaults to ones (uniform noise).
+        # When self.adaptive is False, we ignore spatial_mask for backward-compatibility.
+        if self.adaptive:
+            if spatial_mask is None:
+                spatial_mask = torch.ones((b, 1, h, w), device=x_start.device, dtype=x_start.dtype)
+            # broadcast single-channel -> all channels
+            if spatial_mask.shape[1] == 1 and c > 1:
+                spatial_mask = spatial_mask.expand(b, c, h, w)
+            # safety clamp (avoid negative or NaN scales)
+            spatial_mask = torch.clamp(spatial_mask, min=0.)
+            noise = noise * spatial_mask
+
+            if self.renorm_adaptive_noise:
+                # preserve per-sample global std so comparison vs uniform noise is fair
+                # compute sqrt(mean(mask^2)) over spatialchannel dims
+                denom = (spatial_mask.pow(2).mean(dim=(1,2,3), keepdim=True).sqrt() + 1e-8)
+                noise = noise / denom
+        # --------------------------------------------------------------------------------------
+
 
         # offset noise - https://www.crosslabs.org/blog/diffusion-with-offset-noise
 
@@ -832,15 +867,23 @@ class GaussianDiffusion(Module):
         loss = loss * extract(self.loss_weight, t, loss.shape)
         return loss.mean()
 
-    def forward(self, img, *args, **kwargs):
+    # def forward(self, img, *args, **kwargs):
+    def forward(self, img, *args, spatial_mask=None, **kwargs):
         b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
         assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
         img = self.normalize(img)
-        return self.p_losses(img, t, *args, **kwargs)
+        return self.p_losses(img, t, *args, spatial_mask=spatial_mask, **kwargs)
 
 # dataset classes
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import random
+from einops import rearrange, repeat
+from torchvision.transforms import InterpolationMode
 
 class Dataset(Dataset):
     def __init__(
@@ -849,12 +892,17 @@ class Dataset(Dataset):
         image_size,
         exts = ['jpg', 'jpeg', 'png', 'tiff'],
         augment_horizontal_flip = False,
-        convert_image_to = None
+        convert_image_to = None,
+        mask_folder = None
     ):
         super().__init__()
         self.folder = folder
         self.image_size = image_size
         self.paths = [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')]
+        self.mask_folder = mask_folder
+        self.mask_paths = [p for ext in exts for p in Path(f'{mask_folder}').glob(f'**/*.{ext}')]
+        self.augment_horizontal_flip = augment_horizontal_flip
+
 
         maybe_convert_fn = partial(convert_image_to_fn, convert_image_to) if exists(convert_image_to) else nn.Identity()
 
@@ -865,14 +913,83 @@ class Dataset(Dataset):
             T.CenterCrop(image_size),
             T.ToTensor()
         ])
+        self.class_noise_map = {
+            0: 1.0,   # background (if present)
+            1: 0.8,   # skin
+            2: 0.5,   # left eyebrow
+            3: 0.5,   # right eyebrow
+            4: 0.4,   # left eye
+            5: 0.4,   # right eye
+            6: 0.4,   # eye glass (preserve details)
+            7: 0.8,   # left ear
+            8: 0.8,   # right ear
+            9: 0.8,   # ear ring (medium)
+            10: 0.6,  # nose
+            11: 0.6,  # mouth
+            12: 0.5,  # upper lip
+            13: 0.5,  # lower lip
+            14: 0.8,  # neck
+            15: 0.8,  # neck_l
+            16: 1.0,  # cloth (not important for identity)
+            17: 1.0,  # hair
+            18: 1.0   # hat
+        }
+    def _get_mask_path(self, img_path):
+        if self.mask_folder is None:
+            return None
+        rel_path = img_path.relative_to(self.folder)
+        return Path(self.mask_folder) / rel_path.with_suffix('.png')
+
+    def _load_and_convert_mask(self, mask_img):
+        label_np = np.array(mask_img, dtype=np.uint8)
+        label_tensor = torch.from_numpy(label_np).long()
+
+        noise_mask = torch.zeros_like(label_tensor, dtype=torch.float32)
+        for label, scale in self.class_noise_map.items():
+            noise_mask[label_tensor == label] = scale
+
+        return noise_mask.unsqueeze(0)  # (1,H,W)
 
     def __len__(self):
         return len(self.paths)
 
     def __getitem__(self, index):
         path = self.paths[index]
-        img = Image.open(path)
-        return self.transform(img)
+        img = Image.open(path).convert('RGB')
+
+        mask_img = None
+        if self.mask_folder:
+            mask_path = self._get_mask_path(path)
+            mask_img = Image.open(mask_path)
+
+        # --- Apply transforms manually, preserving randomness for flip ---
+
+        # Resize
+        img = TF.resize(img, self.image_size, interpolation=InterpolationMode.BILINEAR)
+        if mask_img:
+            mask_img = TF.resize(mask_img, self.image_size, interpolation=InterpolationMode.NEAREST)
+
+        # Random horizontal flip (shared randomness)
+        do_flip = self.augment_horizontal_flip and random.random() < 0.5
+        if do_flip:
+            img = TF.hflip(img)
+            if mask_img:
+                mask_img = TF.hflip(mask_img)
+
+        # Center crop
+        img = TF.center_crop(img, self.image_size)
+        if mask_img:
+            mask_img = TF.center_crop(mask_img, self.image_size)
+
+        # Convert to tensor and normalize image
+        img_tensor = TF.to_tensor(img)
+
+        if mask_img:
+            noise_mask = self._load_and_convert_mask(mask_img)
+            return img_tensor, noise_mask
+
+        return img_tensor
+
 
 # trainer class
 
@@ -901,7 +1018,9 @@ class Trainer:
         inception_block_idx = 2048,
         max_grad_norm = 1.,
         num_fid_samples = 50000,
-        save_best_and_latest_only = False
+        save_best_and_latest_only = False,
+        spatial_mask_type = None,
+        mask_folder = None,
     ):
         super().__init__()
 
@@ -919,12 +1038,14 @@ class Trainer:
         is_ddim_sampling = diffusion_model.is_ddim_sampling
 
         # default convert_image_to depending on channels
-
         if not exists(convert_image_to):
             convert_image_to = {1: 'L', 3: 'RGB', 4: 'RGBA'}.get(self.channels)
 
-        # sampling and training hyperparameters
+        ## masking stuff
+        self.spatial_mask_type = spatial_mask_type
+        self.mask_folder = mask_folder
 
+        # sampling and training hyperparameters
         assert has_int_squareroot(num_samples), 'number of samples must have an integer square root'
         self.num_samples = num_samples
         self.save_and_sample_every = save_and_sample_every
@@ -940,7 +1061,10 @@ class Trainer:
 
         # dataset and dataloader
 
-        self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+        if spatial_mask_type == "semantic":
+            self.ds = Dataset(folder, self.image_size, mask_folder=self.mask_folder, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+        else:
+            self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
 
         assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
 
@@ -948,6 +1072,8 @@ class Trainer:
 
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
+
+
 
         # optimizer
 
@@ -1001,6 +1127,14 @@ class Trainer:
 
         self.save_best_and_latest_only = save_best_and_latest_only
 
+        # printing spaital mask
+        # first_batch, spatial_mask = next(iter(self.dl))
+        # mask = create_edge_aware_mask(first_batch)
+        # save_or_show(first_batch[0], "test.png")
+        # save_or_show(spatial_mask[0], "test2.png")
+
+
+
     @property
     def device(self):
         return self.accelerator.device
@@ -1052,10 +1186,21 @@ class Trainer:
                 total_loss = 0.
 
                 for _ in range(self.gradient_accumulate_every):
-                    data = next(self.dl).to(device)
+                    spatial_mask = None
+                    if self.spatial_mask_type == "semantic":
+                        data, mask = next(self.dl)
+                        data = data.to(device)
+                        mask = mask.to(device)
+                        spatial_mask = mask
+                    else:
+                        data = next(self.dl).to(device)
+
+                    if self.spatial_mask_type == "edge_aware":
+                        spatial_mask = create_edge_aware_mask(data, min_noise_scale=0.5, max_noise_scale=1.0)
+
 
                     with self.accelerator.autocast():
-                        loss = self.model(data)
+                        loss = self.model(data, spatial_mask=spatial_mask)
                         loss = loss / self.gradient_accumulate_every
                         total_loss += loss.item()
 
@@ -1088,19 +1233,102 @@ class Trainer:
                         utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = int(math.sqrt(self.num_samples)))
 
                         # whether to calculate fid
+                        if self.step % 25000 == 0:
+                            if self.calculate_fid:
+                                fid_score = self.fid_scorer.fid_score()
+                                accelerator.print(f'fid_score: {fid_score}')
 
-                        if self.calculate_fid:
-                            fid_score = self.fid_scorer.fid_score()
-                            accelerator.print(f'fid_score: {fid_score}')
-
-                        if self.save_best_and_latest_only:
-                            if self.best_fid > fid_score:
-                                self.best_fid = fid_score
-                                self.save("best")
-                            self.save("latest")
-                        else:
-                            self.save(milestone)
+                            if self.save_best_and_latest_only:
+                                if self.best_fid > fid_score:
+                                    self.best_fid = fid_score
+                                    self.save("best")
+                                self.save("latest")
+                            else:
+                                self.save(milestone)
 
                 pbar.update(1)
 
         accelerator.print('training complete')
+
+
+
+
+# Mask Functions
+def create_edge_aware_mask(
+    images: torch.Tensor,
+    min_noise_scale: float = 0.5,
+    max_noise_scale: float = 1.0
+) -> torch.Tensor:
+    """
+    Creates a spatial mask based on edge strength using the Sobel operator.
+    Areas near strong edges will have lower values (less noise),
+    while smooth regions will have higher values (more noise).
+
+    Args:
+        images (torch.Tensor): Input images of shape (B, C, H, W).
+        min_noise_scale (float): Minimum value for the mask.
+        max_noise_scale (float): Maximum value for the mask.
+
+    Returns:
+        torch.Tensor: Edge-aware mask of shape (B, 1, H, W).
+    """
+    assert images.dim() == 4, "Input must be a 4D tensor (B, C, H, W)"
+    b, c, h, w = images.shape
+
+    # 1. Convert to grayscale if needed
+    if c == 3:
+        images_gray = TF.rgb_to_grayscale(images)
+    else:
+        images_gray = images
+
+    # Ensure single channel
+    if images_gray.shape[1] != 1:
+        images_gray = images_gray[:, :1, :, :]
+
+    sobel = kornia.filters.Sobel()
+    edge_map = sobel(images_gray)
+
+
+    # 3. Normalize edge map to [0, 1] per image
+    edge_map_flat = edge_map.view(b, -1)
+    v_min = torch.min(edge_map_flat, dim=1, keepdim=True).values
+    v_max = torch.max(edge_map_flat, dim=1, keepdim=True).values
+    normalized_edges = (edge_map_flat - v_min) / (v_max - v_min + 1e-8)
+    normalized_edges = normalized_edges.view(b, 1, h, w)
+
+    # 4. Invert and scale the map
+    inverted_map = 1.0 - normalized_edges
+    spatial_mask = min_noise_scale + inverted_map * (max_noise_scale - min_noise_scale)
+
+    return spatial_mask
+
+import torchvision.transforms.functional as TF
+from torchvision.utils import save_image
+import matplotlib.pyplot as plt
+
+def save_or_show(tensor, filename=None, title=None):
+    """
+    Save a tensor as a PNG or display it with matplotlib.
+    tensor shape: (1, H, W) or (C, H, W), values expected in [0, 1]
+    """
+    img = tensor.detach().cpu()
+    
+    # If single channel, squeeze channel dim for plt.imshow
+    if img.shape[0] == 1:
+        img = img.squeeze(0)
+        if title:
+            plt.title(title)
+        plt.imshow(img, cmap='gray')
+    else:
+        # For 3 channels, convert to (H,W,C)
+        img = img.permute(1, 2, 0)
+        if title:
+            plt.title(title)
+        plt.imshow(img)
+
+    if filename:
+        save_image(tensor, filename)
+        print(f"Saved {filename}")
+    else:
+        plt.axis('off')
+        plt.show()
