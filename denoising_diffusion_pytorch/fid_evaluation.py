@@ -7,6 +7,7 @@ from einops import rearrange, repeat
 from pytorch_fid.fid_score import calculate_frechet_distance
 from pytorch_fid.inception import InceptionV3
 from torch.nn.functional import adaptive_avg_pool2d
+from .denoising_diffusion_pytorch import create_edge_aware_mask
 from tqdm.auto import tqdm
 
 
@@ -31,6 +32,8 @@ class FIDEvaluation:
         device="cuda",
         num_fid_samples=50000,
         inception_block_idx=2048,
+        conditional_mask_type = None
+
     ):
         self.batch_size = batch_size
         self.n_samples = num_fid_samples
@@ -39,6 +42,7 @@ class FIDEvaluation:
         self.dl = dl
         self.sampler = sampler
         self.stats_dir = stats_dir
+        self.conditional_mask_type = conditional_mask_type
         self.print_fn = print if accelerator is None else accelerator.print
         assert inception_block_idx in InceptionV3.BLOCK_INDEX_BY_DIM
         block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[inception_block_idx]
@@ -71,11 +75,23 @@ class FIDEvaluation:
                 f"Stacking Inception features for {self.n_samples} samples from the real dataset."
             )
             for _ in tqdm(range(num_batches)):
-                try:
-                    real_samples = next(self.dl)
-                except StopIteration:
-                    break
+                data = next(self.dl)
+                if self.conditional_mask_type == "semantic":
+                    real_samples, mask = data
+                elif self.conditional_mask_type == "edge_aware":
+                    real_samples = data
+                    mask = create_edge_aware_mask(real_samples)
+                else:
+                    if type(data) == list:
+                        real_samples, _ = data
+                    else:
+                        real_samples = data
+                    mask = None
+
                 real_samples = real_samples.to(self.device)
+                if mask is not None:
+                    mask = mask.to(self.device)
+
                 real_features = self.calculate_inception_features(real_samples)
                 stacked_real_features.append(real_features)
             stacked_real_features = (
@@ -98,8 +114,29 @@ class FIDEvaluation:
         self.print_fn(
             f"Stacking Inception features for {self.n_samples} generated samples."
         )
-        for batch in tqdm(batches):
-            fake_samples = self.sampler.sample(batch_size=batch)
+        for b in tqdm(batches):
+            # fake_samples = self.sampler.sample(batch_size=batch)
+            # fake_features = self.calculate_inception_features(fake_samples)
+
+            if self.conditional_mask_type== "semantic":
+                # Get batch, mask from dataloader
+                batch, mask = next(self.dl)
+                batch = batch.to(self.device)
+                assert (b <= batch.shape[0]) # not enouhg samples in the batch
+                idx = torch.randperm(batch.shape[0], device=self.device)[:b]
+                mask = mask[idx]
+
+                fake_samples = self.sampler.sample(batch_size=b, cond=mask)
+            elif self.conditional_mask_type == "edge_aware":
+                batch = next(self.dl)
+                batch = batch.to(self.device)
+                assert (b <= batch.shape[0]) # not enouhg samples in the batch
+                idx = torch.randperm(batch.shape[0], device=self.device)[:b]
+                mask = create_edge_aware_mask(batch[idx])
+                fake_samples = self.sampler.sample(batch_size=b, cond=mask)
+            else:
+                fake_samples = self.sampler.sample(batch_size=b)
+
             fake_features = self.calculate_inception_features(fake_samples)
             stacked_fake_features.append(fake_features)
         stacked_fake_features = torch.cat(stacked_fake_features, dim=0).cpu().numpy()

@@ -516,6 +516,7 @@ class GaussianDiffusion(Module):
         immiscible = False,
         adaptive = False,
         renorm_adaptive_noise = True,
+        masked_loss = False,
 
     ):
         super().__init__()
@@ -525,6 +526,7 @@ class GaussianDiffusion(Module):
         self.model = model
         self.adaptive = adaptive
         self.renorm_adaptive_noise = renorm_adaptive_noise
+        self.masked_loss = masked_loss
 
         self.channels = self.model.channels
         self.self_condition = self.model.self_condition
@@ -880,7 +882,18 @@ class GaussianDiffusion(Module):
             raise ValueError(f'unknown objective {self.objective}')
 
         loss = F.mse_loss(model_out, target, reduction = 'none')
-        loss = reduce(loss, 'b ... -> b', 'mean')
+
+        if self.masked_loss:
+            if spatial_mask.shape[1] == 1 and loss.shape[1] > 1:
+                spatial_mask_expanded = spatial_mask.expand(-1, loss.shape[1], -1, -1)
+            else:
+                spatial_mask_expanded = spatial_mask
+
+            weighted_loss = loss * spatial_mask_expanded
+            norm_factor = spatial_mask_expanded.sum(dim=[1, 2, 3]) + 1e-8
+            loss = weighted_loss.sum(dim=[1, 2, 3]) / norm_factor
+        else:
+            loss = reduce(loss, 'b ... -> b', 'mean')
 
         loss = loss * extract(self.loss_weight, t, loss.shape)
         return loss.mean()
@@ -938,25 +951,25 @@ class Dataset(Dataset):
             T.ToTensor()
         ])
         self.class_noise_map = {
-            0: 1.0,   # background (if present)
-            1: 0.8,   # skin
-            2: 0.5,   # left eyebrow
-            3: 0.5,   # right eyebrow
-            4: 0.4,   # left eye
-            5: 0.4,   # right eye
-            6: 0.4,   # eye glass (preserve details)
-            7: 0.8,   # left ear
-            8: 0.8,   # right ear
-            9: 0.8,   # ear ring (medium)
-            10: 0.6,  # nose
-            11: 0.6,  # mouth
-            12: 0.5,  # upper lip
-            13: 0.5,  # lower lip
-            14: 0.8,  # neck
-            15: 0.8,  # neck_l
-            16: 1.0,  # cloth (not important for identity)
-            17: 1.0,  # hair
-            18: 1.0   # hat
+            0: .8,   # background (if present)
+            1: 0.6,   # skin
+            2: 0.4,   # left eyebrow
+            3: 0.4,   # right eyebrow
+            4: 0.2,   # left eye
+            5: 0.2,   # right eye
+            6: 0.3,   # eye glass (preserve details)
+            7: 0.5,   # left ear
+            8: 0.5,   # right ear
+            9: 0.5,   # ear ring (medium)
+            10: 0.2,  # nose
+            11: 0.2,  # mouth
+            12: 0.2,  # upper lip
+            13: 0.2,  # lower lip
+            14: 0.4,  # neck
+            15: 0.4,  # neck_l
+            16: .7,  # cloth (not important for identity)
+            17: .5,  # hair
+            18: 1   # hat
         }
     def _get_mask_path(self, img_path):
         if self.mask_folder is None:
@@ -964,13 +977,15 @@ class Dataset(Dataset):
         rel_path = img_path.relative_to(self.folder)
         return Path(self.mask_folder) / rel_path.with_suffix('.png')
 
-    def _load_and_convert_mask(self, mask_img):
+    def _load_and_convert_mask(self, mask_img, importance=True):
+        # if importance is True then semantic regions have higher value
         label_np = np.array(mask_img, dtype=np.uint8)
         label_tensor = torch.from_numpy(label_np).long()
 
         noise_mask = torch.zeros_like(label_tensor, dtype=torch.float32)
         for label, scale in self.class_noise_map.items():
-            noise_mask[label_tensor == label] = scale
+            value = 1.0 - scale if importance else scale
+            noise_mask[label_tensor == label] = value
 
         return noise_mask.unsqueeze(0)  # (1,H,W)
 
@@ -1055,7 +1070,9 @@ class Trainer:
         save_best_and_latest_only = False,
         adaptive_mask_type = None,
         conditional_mask_type = None,
+        masked_loss_type = None,
         mask_folder = None,
+
     ):
         super().__init__()
 
@@ -1082,6 +1099,7 @@ class Trainer:
 
         # conditional concat stuff
         self.conditional_mask_type = conditional_mask_type
+        self.masked_loss_type = masked_loss_type
 
         # sampling and training hyperparameters
         assert has_int_squareroot(num_samples), 'number of samples must have an integer square root'
@@ -1100,7 +1118,7 @@ class Trainer:
         # dataset and dataloader
         # either we want to add semantic mask to noise or concat semantic mask
         assert (not (adaptive_mask_type is not None and conditional_mask_type is not None)), f"Cannot have both adaptive_mask_type = {adaptive_mask_type} and conditional_mask = {conditional_mask_type} at the same time"
-        if adaptive_mask_type == "semantic":
+        if adaptive_mask_type == "semantic" or masked_loss_type=="semantic":
             self.ds = Dataset(folder, self.image_size, mask_folder=self.mask_folder, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to, noise_mask=True)
         elif conditional_mask_type == "semantic":
             self.ds = Dataset(folder, self.image_size, mask_folder=self.mask_folder, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to, conditional_mask=True)
@@ -1159,7 +1177,8 @@ class Trainer:
                 stats_dir=results_folder,
                 device=self.device,
                 num_fid_samples=num_fid_samples,
-                inception_block_idx=inception_block_idx
+                inception_block_idx=inception_block_idx,
+                conditional_mask_type=conditional_mask_type
             )
 
         if save_best_and_latest_only:
@@ -1169,10 +1188,10 @@ class Trainer:
         self.save_best_and_latest_only = save_best_and_latest_only
 
         # printing spaital mask
-        # first_batch, spatial_mask = next(iter(self.dl))
+        # first_batch= next(iter(self.dl))
         # mask = create_edge_aware_mask(first_batch)
         # save_or_show(first_batch[0], "test.png")
-        # save_or_show(spatial_mask[0], "test2.png")
+        # save_or_show(mask[0], "test2.png")
 
 
 
@@ -1242,7 +1261,7 @@ class Trainer:
 
                 for _ in range(self.gradient_accumulate_every):
                     spatial_mask = None
-                    if self.adaptive_mask_type == "semantic" or self.conditional_mask_type == "semantic":
+                    if self.adaptive_mask_type == "semantic" or self.conditional_mask_type == "semantic" or self.masked_loss_type == "semantic":
                         data, mask = next(self.dl)
                         data = data.to(device)
                         mask = mask.to(device)
@@ -1250,16 +1269,16 @@ class Trainer:
                     else:
                         data = next(self.dl).to(device)
 
-                    if self.adaptive_mask_type == "edge_aware" or self.conditional_mask_type == "edge_aware":
+                    if self.adaptive_mask_type == "edge_aware" or self.conditional_mask_type == "edge_aware" or self.masked_loss_type == "edge_aware":
                         spatial_mask = create_edge_aware_mask(data, min_noise_scale=0.5, max_noise_scale=1.0)
 
 
                     with self.accelerator.autocast():
-                        if self.adaptive_mask_type is not None:
-                            assert(spatial_mask is not None and self.adaptive_mask_type in ("edge_aware", "semantic")), "Choose correct adaptive mask type"
+                        if self.adaptive_mask_type is not None or self.masked_loss_type is not None:
+                            assert(self.adaptive_mask_type in ("edge_aware", "semantic") or self.masked_loss_type in ("edge_aware", "semantic")), "Choose correct adaptive mask type"
                             loss = self.model(data, spatial_mask=spatial_mask)
                         elif self.conditional_mask_type is not None:
-                            assert(spatial_mask is not None and self.conditional_mask_type in ("edge_aware", "semantic")), "Choose correct conditional mask type"
+                            assert( self.conditional_mask_type in ("edge_aware", "semantic")), "Choose correct conditional mask type"
                             loss = self.model(data, cond=spatial_mask)
                         else:
                             loss = self.model(data)
@@ -1333,7 +1352,8 @@ class Trainer:
 def create_edge_aware_mask(
     images: torch.Tensor,
     min_noise_scale: float = 0.5,
-    max_noise_scale: float = 1.0
+    max_noise_scale: float = 1.0,
+    invert = False,
 ) -> torch.Tensor:
     """
     Creates a spatial mask based on edge strength using the Sobel operator.
@@ -1373,8 +1393,10 @@ def create_edge_aware_mask(
     normalized_edges = normalized_edges.view(b, 1, h, w)
 
     # 4. Invert and scale the map
-    inverted_map = 1.0 - normalized_edges
-    spatial_mask = min_noise_scale + inverted_map * (max_noise_scale - min_noise_scale)
+    if invert:
+        normalized_edges = 1.0 - normalized_edges
+
+    spatial_mask = min_noise_scale + normalized_edges * (max_noise_scale - min_noise_scale)
 
     return spatial_mask
 
