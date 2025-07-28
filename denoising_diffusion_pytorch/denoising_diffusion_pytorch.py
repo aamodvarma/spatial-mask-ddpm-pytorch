@@ -402,6 +402,9 @@ class Unet(Module):
             x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
             x = torch.cat((x_self_cond, x), dim = 1)
 
+        # TEMPORARY - CONCATS THE CHANNELS TO A SINGEL CHANNEL BY MAX POOLING!!!
+        # cond = torch.max(x, dim=1, keepdim=True)[0]
+
         if self.cond_channels > 0:
             if cond is None:
                 raise ValueError("UNet was constructed with cond_channels > 0 but no `cond` tensor was passed.")

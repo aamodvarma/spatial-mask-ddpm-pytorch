@@ -8,7 +8,7 @@ model = Unet(
     dim_mults = (1, 2, 4, 8),
     channels=3,
     flash_attn = False,
-    # cond_channels=1 # 19 for semantic, 1 for edge aware 
+    cond_channels=1 # 19 for semantic, 1 for edge aware 
 )
 diffusion = GaussianDiffusion(
     model,
@@ -20,7 +20,7 @@ diffusion = GaussianDiffusion(
     min_snr_gamma=5,
     offset_noise_strength=0.0,
     adaptive=False, # True for spatially adaptive noise
-    masked_loss=True, # True for spatially adaptive noise
+    masked_loss=False, # True for spatially adaptive noise
 )
 
 trainer = Trainer(
@@ -36,13 +36,13 @@ trainer = Trainer(
     calculate_fid = True,
     num_fid_samples=5000,
     # results_folder="/home/hice1/avarma49/scratch/results/results128_edgeaware_noise",
-    results_folder="/home/hice1/avarma49/scratch/results/results128_semantic_masked_loss_v2",
+    results_folder="/home/hice1/avarma49/scratch/results/results128_conditional_semantic_v2",
     # results_folder="/home/hice1/avarma49/scratch/results/results128_edgeaware_masked_loss",
     # results_folder="/home/hice1/avarma49/scratch/results/results128_default",
     mask_folder = "/home/hice1/avarma49/scratch/ffhq-128-masks", # only on for semantic - going to be automatically ignored for edge_aware
     # adaptive_mask_type = "edge_aware", # only for adaptive noise
-    # conditional_mask_type = "edge_aware",
-    masked_loss_type = "semantic"
+    conditional_mask_type = "semantic",
+    # masked_loss_type = "semantic"
 )
 
 # resume from checkpoint
